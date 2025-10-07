@@ -1,5 +1,5 @@
 # To install dependencies:
-# !pip install torch numpy torch_geometric GPUtil psutil
+# !pip install torch numpy tqdm
 
 import os
 import sys
@@ -10,6 +10,8 @@ import numpy as np
 from collections import deque
 import json
 from datetime import datetime
+from tqdm import tqdm
+import warnings
 
 import torch
 import torch.nn as nn
@@ -17,20 +19,33 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import torch.nn.functional as F
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('water_sort_training.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# Setup logging - tương thích với Jupyter/Colab
+warnings.filterwarnings('ignore')
+
+# Tạo logger đơn giản không conflict với notebook
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
+# Chỉ log vào file, không log ra console
+try:
+    file_handler = logging.FileHandler('water_sort_training.log', mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logger.addHandler(file_handler)
+except:
+    pass  # Bỏ qua nếu không thể tạo file log
+
+# Helper function cho console output
+def print_info(message):
+    """Print important info to console"""
+    print(f"\n{message}")
+    try:
+        logger.info(message)
+    except:
+        pass  # Bỏ qua nếu logger fail
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"Using device: {device}")
 
 class WaterSortEnv:
     """Optimized Water Sort Puzzle Environment"""
@@ -174,7 +189,6 @@ class WaterSortEnv:
             
         # Reward for filling tubes with same color
         if to_tube_after > 1 and len(self.tubes[to_tube]) > 0:
-            # Kiểm tra tất cả viên bi trong to_tube có cùng màu không
             if all(c == self.tubes[to_tube][0] for c in self.tubes[to_tube]):
                 reward += 0.05 * to_tube_after
             
@@ -202,7 +216,6 @@ class AttentionPooling(nn.Module):
         )
         
     def forward(self, x):
-        # x: [batch_size, num_nodes, hidden_dim]
         attn_weights = torch.softmax(self.attention(x), dim=1)
         return torch.sum(attn_weights * x, dim=1)
 
@@ -217,7 +230,7 @@ class WaterSortPolicyNetwork(nn.Module):
         self.hidden_dim = hidden_dim
         
         # State processing
-        state_dim = tube_capacity + 2  # +2 for completion status and fill level
+        state_dim = tube_capacity + 2
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -275,11 +288,10 @@ class WaterSortPolicyNetwork(nn.Module):
         # Global context
         global_context = self.attention_pool(transformer_out)
         
-        # Policy logits - tạo logits cho TẤT CẢ các cặp tube (bao gồm cả invalid moves)
+        # Policy logits
         policy_inputs = []
         for i in range(self.num_tubes):
             for j in range(self.num_tubes):
-                # Concatenate: from_tube, to_tube, global_context
                 pair_embedding = torch.cat([
                     transformer_out[:, i],
                     transformer_out[:, j], 
@@ -287,8 +299,8 @@ class WaterSortPolicyNetwork(nn.Module):
                 ], dim=-1)
                 policy_inputs.append(pair_embedding)
         
-        policy_inputs = torch.stack(policy_inputs, dim=1)  # [batch_size, num_tubes*num_tubes, hidden_dim*3]
-        policy_logits = self.policy_head(policy_inputs).squeeze(-1)  # ✅ [batch_size, num_tubes*num_tubes] - giờ mới đúng!
+        policy_inputs = torch.stack(policy_inputs, dim=1)
+        policy_logits = self.policy_head(policy_inputs).squeeze(-1)
         
         # Value estimate
         state_value = self.value_head(global_context).squeeze(-1)
@@ -296,7 +308,7 @@ class WaterSortPolicyNetwork(nn.Module):
         return policy_logits, state_value
 
 class PPOTrainer:
-    """Enhanced PPO Trainer with GAE and advanced logging"""
+    """Enhanced PPO Trainer with GAE"""
     
     def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95,
                  clip_epsilon=0.2, value_coef=0.5, entropy_coef=0.01,
@@ -305,7 +317,6 @@ class PPOTrainer:
         self.model = model.to(device)
         self.optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
         
-        # Hyperparameters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_epsilon = clip_epsilon
@@ -313,7 +324,6 @@ class PPOTrainer:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         
-        # Tracking
         self.training_step = 0
         self.best_win_rate = 0
         self.metrics = {
@@ -325,26 +335,6 @@ class PPOTrainer:
             'clip_fraction': [],
             'explained_variance': []
         }
-    
-    def compute_advantages(self, rewards, values, dones, next_value):
-        """Compute advantages using Generalized Advantage Estimation (GAE)"""
-        advantages = []
-        gae = 0
-        next_value = next_value.detach()
-        
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_non_terminal = 1.0 - dones[t]
-                next_values = next_value
-            else:
-                next_non_terminal = 1.0 - dones[t]
-                next_values = values[t + 1]
-            
-            delta = rewards[t] + self.gamma * next_values * next_non_terminal - values[t]
-            gae = delta + self.gamma * self.gae_lambda * next_non_terminal * gae
-            advantages.insert(0, gae)
-            
-        return torch.tensor(advantages, device=device)
     
     def update(self, batch):
         """Update model with PPO"""
@@ -376,10 +366,7 @@ class PPOTrainer:
         # Optimization step
         self.optimizer.zero_grad()
         loss.backward()
-        
-        # Gradient clipping
         grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-        
         self.optimizer.step()
         self.training_step += 1
         
@@ -389,7 +376,6 @@ class PPOTrainer:
             clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
             explained_var = 1 - (returns - values).var() / returns.var()
             
-        # Update metrics
         self.metrics['loss'].append(loss.item())
         self.metrics['policy_loss'].append(policy_loss.item())
         self.metrics['value_loss'].append(value_loss.item())
@@ -494,11 +480,9 @@ class CurriculumManager:
         
         if avg_win_rate >= current_target and self.current_level < len(self.levels) - 1:
             self.current_level += 1
-            logger.info(f"🎯 Advancing to level {self.current_level + 1}")
             return True
         elif avg_win_rate < current_target * 0.5 and self.current_level > 0:
             self.current_level -= 1
-            logger.info(f"🔙 Regressing to level {self.current_level + 1}")
             return True
         
         return False
@@ -513,6 +497,50 @@ def setup_logging_and_checkpoints():
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     return log_dir, checkpoint_dir
+
+def download_model(model_path, training_metrics):
+    """Tự động tải xuống model và metrics"""
+    try:
+        import shutil
+        
+        # Tạo thư mục download
+        download_dir = "downloaded_models"
+        os.makedirs(download_dir, exist_ok=True)
+        
+        # Copy model file
+        model_filename = os.path.basename(model_path)
+        download_path = os.path.join(download_dir, model_filename)
+        shutil.copy2(model_path, download_path)
+        
+        # Save metrics
+        metrics_path = os.path.join(download_dir, "training_metrics.json")
+        with open(metrics_path, 'w') as f:
+            json.dump(training_metrics, f, indent=2)
+        
+        # Create summary file
+        summary_path = os.path.join(download_dir, "training_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("WATER SORT PUZZLE - TRAINING SUMMARY\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Model saved at: {download_path}\n")
+            f.write(f"Metrics saved at: {metrics_path}\n\n")
+            
+            if training_metrics['win_rate']:
+                f.write(f"Best Win Rate: {max(training_metrics['win_rate']):.3f}\n")
+                f.write(f"Final Win Rate: {training_metrics['win_rate'][-1]:.3f}\n")
+                f.write(f"Total Training Steps: {training_metrics['step'][-1]}\n")
+        
+        print_info(f"✅ Model và metrics đã được tải xuống vào: {download_dir}/")
+        print_info(f"   - Model: {model_filename}")
+        print_info(f"   - Metrics: training_metrics.json")
+        print_info(f"   - Summary: training_summary.txt")
+        
+        return download_path
+        
+    except Exception as e:
+        print(f"⚠️  Lỗi khi tải xuống model: {e}")
+        return None
 
 def evaluate_policy(env, model, num_episodes=10):
     """Evaluate current policy"""
@@ -540,7 +568,6 @@ def evaluate_policy(env, model, num_episodes=10):
                 action_idx = action % len(valid_moves)
                 from_tube, to_tube = valid_moves[action_idx]
             else:
-                # No valid moves, choose random
                 from_tube, to_tube = random.choice([(i, j) for i in range(env.num_tubes) 
                                                   for j in range(env.num_tubes) if i != j])
             
@@ -560,7 +587,7 @@ def evaluate_policy(env, model, num_episodes=10):
     return win_rate, avg_reward, avg_moves
 
 def train_water_sort_agent():
-    """Main training function"""
+    """Main training function với progress bar"""
     
     # Setup
     log_dir, checkpoint_dir = setup_logging_and_checkpoints()
@@ -591,11 +618,17 @@ def train_water_sort_agent():
         'level': []
     }
     
-    logger.info("🚀 Starting Water Sort Puzzle Training")
-    logger.info(f"Initial level: {current_config}")
+    print_info("🚀 BẮT ĐẦU TRAINING WATER SORT PUZZLE")
+    print_info(f"📋 Cấu hình ban đầu: {current_config}")
+    print_info(f"💻 Device: {device}")
     
     step = 0
     best_win_rate = 0
+    best_model_path = None
+    
+    # Progress bar chính
+    pbar = tqdm(total=total_training_steps, desc="Training Progress", 
+                unit="step", ncols=100, colour='green')
     
     while step < total_training_steps:
         # Create environment for current level
@@ -610,17 +643,17 @@ def train_water_sort_agent():
         state = env.reset()
         episode_reward = 0
         episode_steps = 0
+        done = False
         
-        while not env.game_over and episode_steps < env.max_moves:
+        while not done and episode_steps < env.max_moves and step < total_training_steps:
             # Prepare state
             state_t = torch.FloatTensor(state).unsqueeze(0).to(device)
             
             # Get action
-            # Get action
             with torch.no_grad():
                 policy_logits, value = model(state_t)
 
-                # Mask invalid actions bằng cách set logits = -inf
+                # Mask invalid actions
                 action_mask = torch.full((1, env.num_tubes * env.num_tubes), float('-inf'), device=device)
                 valid_moves = env.get_valid_moves()
 
@@ -634,35 +667,32 @@ def train_water_sort_agent():
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
 
-                    # Convert action index to tube pair - FIX: xử lý tensor multi-element
-                    action_flat = action.flatten()  # Chuyển về tensor 1D
+                    # Convert action index to tube pair
+                    action_flat = action.flatten()
                     if action_flat.numel() > 1:
-                        if step < 10:  # Chỉ log 10 bước đầu để debug
-                            logger.debug(f"Action tensor has {action_flat.numel()} elements, taking first element")
-                        action_idx = action_flat[0].item()  # Lấy phần tử đầu tiên
+                        action_idx = action_flat[0].item()
                     else:
-                        action_idx = action_flat.item()  # Lấy trực tiếp nếu là scalar
+                        action_idx = action_flat.item()
                     from_tube = action_idx // env.num_tubes
                     to_tube = action_idx % env.num_tubes
                     
-                    # ✅ GÁN LẠI action và log_prob thành scalar tensor
                     action = torch.tensor(action_idx, device=device)
                     log_prob_flat = log_prob.flatten()
                     log_prob = log_prob_flat[0] if log_prob_flat.numel() > 1 else log_prob
                 else:
-                    # Fallback to random move - FIX: tạo action đúng cách
+                    # Fallback to random move
                     from_tube, to_tube = random.choice([(i, j) for i in range(env.num_tubes)
                                                     for j in range(env.num_tubes) if i != j])
                     action_idx = from_tube * env.num_tubes + to_tube
-                    action = torch.tensor(action_idx, device=device)  # ✅ Sửa: tạo scalar tensor
-                    log_prob = torch.tensor(0.0, device=device)      # ✅ Sửa: tạo scalar tensor
-                
-                # Take action
-                next_state, reward, done, info = env.step((from_tube, to_tube))
-                
-                # Store experience
-                action_value = action.item()
-                log_prob_value = log_prob.item()
+                    action = torch.tensor(action_idx, device=device)
+                    log_prob = torch.tensor(0.0, device=device)
+            
+            # Take action
+            next_state, reward, done, info = env.step((from_tube, to_tube))
+            
+            # Store experience
+            action_value = action.item()
+            log_prob_value = log_prob.item()
             
             collector.add_experience(
                 state, action_value, reward,
@@ -674,22 +704,31 @@ def train_water_sort_agent():
             episode_steps += 1
             step += 1
             
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix({
+                'Reward': f'{episode_reward:.2f}',
+                'Level': curriculum.current_level + 1,
+                'Best_WR': f'{best_win_rate:.2%}'
+            })
+            
             # Train if we have enough experiences
             if len(collector.states) >= batch_size:
                 batch = collector.process_trajectory()
                 metrics = trainer.update(batch)
-                
-                if step % 100 == 0:
-                    logger.info(f"Step {step}: Loss={metrics['total_loss']:.4f}, "
-                               f"Policy Loss={metrics['policy_loss']:.4f}, "
-                               f"Value Loss={metrics['value_loss']:.4f}")
             
             # Evaluation and logging
             if step % eval_interval == 0:
+                pbar.write(f"\n{'='*50}")
+                pbar.write(f"📊 ĐÁNH GIÁ TẠI STEP {step}")
+                pbar.write(f"{'='*50}")
+                
                 win_rate, avg_reward, avg_moves = evaluate_policy(env, model)
                 
                 # Update curriculum
-                curriculum.update_level(win_rate)
+                level_changed = curriculum.update_level(win_rate)
+                if level_changed:
+                    pbar.write(f"🎯 Chuyển level: {curriculum.current_level + 1}")
                 
                 # Save metrics
                 training_metrics['step'].append(step)
@@ -698,24 +737,23 @@ def train_water_sort_agent():
                 training_metrics['avg_moves'].append(avg_moves)
                 training_metrics['level'].append(curriculum.current_level)
                 
-                logger.info(f"📊 Evaluation at step {step}: "
-                           f"Win Rate={win_rate:.3f}, "
-                           f"Avg Reward={avg_reward:.2f}, "
-                           f"Avg Moves={avg_moves:.1f}, "
-                           f"Level={curriculum.current_level + 1}")
+                pbar.write(f"   Win Rate: {win_rate:.1%}")
+                pbar.write(f"   Avg Reward: {avg_reward:.2f}")
+                pbar.write(f"   Avg Moves: {avg_moves:.1f}")
+                pbar.write(f"   Level: {curriculum.current_level + 1}")
                 
                 # Save best model
                 if win_rate > best_win_rate:
                     best_win_rate = win_rate
-                    model_path = os.path.join(checkpoint_dir, f"best_model_{step}.pth")
+                    best_model_path = os.path.join(checkpoint_dir, f"best_model_{step}.pth")
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': trainer.optimizer.state_dict(),
                         'step': step,
                         'win_rate': win_rate,
                         'metrics': training_metrics
-                    }, model_path)
-                    logger.info(f"💾 New best model saved: {model_path}")
+                    }, best_model_path)
+                    pbar.write(f"💾 Model tốt nhất mới đã lưu!")
             
             # Save checkpoint
             if step % save_interval == 0:
@@ -732,17 +770,26 @@ def train_water_sort_agent():
                 metrics_path = os.path.join(log_dir, "training_metrics.json")
                 with open(metrics_path, 'w') as f:
                     json.dump(training_metrics, f, indent=2)
-                
-                logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
     
-    logger.info("🎉 Training completed!")
+    pbar.close()
+    
+    print_info("\n" + "="*60)
+    print_info("🎉 TRAINING HOÀN TẤT!")
+    print_info("="*60)
     
     # Final evaluation
+    print_info("\n🔍 Đang đánh giá hiệu suất cuối cùng...")
     final_win_rate, final_reward, final_moves = evaluate_policy(env, model, num_episodes=100)
-    logger.info(f"🏆 Final Performance: "
-               f"Win Rate={final_win_rate:.3f}, "
-               f"Avg Reward={final_reward:.2f}, "
-               f"Avg Moves={final_moves:.1f}")
+    
+    print_info("\n📈 KẾT QUẢ CUỐI CÙNG:")
+    print_info(f"   Win Rate: {final_win_rate:.1%}")
+    print_info(f"   Avg Reward: {final_reward:.2f}")
+    print_info(f"   Avg Moves: {final_moves:.1f}")
+    
+    # Tự động tải xuống model
+    if best_model_path:
+        print_info("\n📥 Đang tải xuống model...")
+        download_model(best_model_path, training_metrics)
     
     return model, training_metrics
 
@@ -755,11 +802,18 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
     
+    print_info("=" * 60)
+    print_info("🚀 WATER SORT PUZZLE - PPO TRAINING")
+    print_info("=" * 60)
+    print_info(f"💻 Device: {device}")
+    
     try:
         model, metrics = train_water_sort_agent()
-        logger.info("✅ Training completed successfully!")
+        print_info("\n✅ HOÀN THÀNH THÀNH CÔNG!")
+    except KeyboardInterrupt:
+        print_info("\n⚠️  Training bị dừng bởi người dùng")
     except Exception as e:
-        logger.error(f"❌ Training failed with error: {e}")
+        print_info(f"\n❌ LỖI: {e}")
+        import traceback
+        traceback.print_exc()
         raise
-    
-##
