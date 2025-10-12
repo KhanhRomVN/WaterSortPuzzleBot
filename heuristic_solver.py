@@ -1,5 +1,5 @@
-# heuristic_solver_parallel.py
-# Phase 1: Generate training data with A* Solver (OPTIMIZED FOR MULTIPROCESSING)
+# heuristic_solver.py
+# Phase 1: Generate training data with A* Solver
 # =============================================================================
 
 import numpy as np
@@ -11,8 +11,6 @@ from tqdm import tqdm
 from datetime import datetime, timedelta
 from heapq import heappush, heappop
 from collections import deque
-from multiprocessing import Pool, cpu_count, Manager
-from functools import partial
 
 # =============================================================================
 # 1. WATER SORT ENVIRONMENT
@@ -349,193 +347,120 @@ class GreedyFallback:
         return score
 
 # =============================================================================
-# 4. WORKER FUNCTION (cho multiprocessing)
+# 4. DATA GENERATION
 # =============================================================================
 
-def solve_single_game(args):
-    """
-    Worker function để solve 1 game
-    Được gọi bởi multiprocessing Pool
-    
-    Args:
-        args: tuple (game_idx, num_colors, bottle_height, num_bottles, seed)
-    
-    Returns:
-        dict chứa kết quả
-    """
-    game_idx, num_colors, bottle_height, num_bottles, seed = args
-    
-    # Set random seed cho reproducibility
-    np.random.seed(seed)
-    random.seed(seed)
-    
-    # Tạo environment
-    env = WaterSortEnv(num_colors, bottle_height, num_bottles)
-    state = env.reset()
-    
-    # Tạo solvers
-    astar_solver = AStarSolver(env)
-    greedy_solver = GreedyFallback(env)
-    
-    # Try A* first
-    solution, success = astar_solver.solve(max_moves=1000, debug=False)
-    used_astar = success
-    
-    # Fallback to Greedy if A* fails
-    if not success:
-        greedy_env = WaterSortEnv(num_colors, bottle_height, num_bottles)
-        greedy_env.bottles = state.copy()
-        greedy_solver.env = greedy_env
-        solution, success = greedy_solver.solve(max_moves=200)
-    
-    # Generate training samples
-    samples = []
-    if success:
-        temp_env = WaterSortEnv(num_colors, bottle_height, num_bottles)
-        temp_env.bottles = state.copy()
-        
-        for move_idx, move in enumerate(solution):
-            current_state = temp_env.get_state()
-            
-            # Policy target (one-hot encoding)
-            policy_target = np.zeros(num_bottles * num_bottles)
-            move_index = move[0] * num_bottles + move[1]
-            policy_target[move_index] = 1.0
-            
-            # Value target (progress-based)
-            remaining_moves = len(solution) - move_idx
-            value_target = 1.0 - (remaining_moves / len(solution)) * 0.5
-            
-            samples.append((current_state, policy_target, value_target))
-            temp_env.step(move)
-    
-    return {
-        'game_idx': game_idx,
-        'success': success,
-        'used_astar': used_astar,
-        'moves': len(solution) if success else 0,
-        'samples': samples,
-        'astar_nodes': astar_solver.debug_info['nodes_expanded']
-    }
-
-# =============================================================================
-# 5. PARALLEL DATA GENERATION
-# =============================================================================
-
-class ParallelHeuristicDataGenerator:
-    """Generate training data using multiprocessing"""
+class HeuristicDataGenerator:
+    """Generate training data using A* Solver"""
     
     def __init__(self, num_colors=6, bottle_height=4, num_bottles=8):
-        self.num_colors = num_colors
-        self.bottle_height = bottle_height
-        self.num_bottles = num_bottles
+        self.env = WaterSortEnv(num_colors, bottle_height, num_bottles)
+        self.astar_solver = AStarSolver(self.env)
+        self.greedy_solver = GreedyFallback(self.env)
         self.dataset = []
         self.failed_games = []
     
-    def generate_data_parallel(self, num_games=5000, num_workers=None, chunk_size=50):
-        """
-        Generate training data using multiprocessing
+    def generate_data(self, num_games=5000, debug_interval=500):
+        """Generate training data from A* solver"""
+        print(f"🎯 Generating {num_games} expert games with A* Solver...")
         
-        Args:
-            num_games: Số lượng games cần generate
-            num_workers: Số worker processes (None = auto detect)
-            chunk_size: Số games mỗi chunk (để update progress bar)
-        """
-        if num_workers is None:
-            num_workers = max(1, cpu_count() - 1)  # Để lại 1 core cho system
-        
-        print(f"🚀 MULTIPROCESSING MODE")
-        print(f"   CPU cores available: {cpu_count()}")
-        print(f"   Using workers: {num_workers}")
-        print(f"   Total games: {num_games}")
-        print(f"   Chunk size: {chunk_size}\n")
-        
-        # Prepare arguments cho workers
-        worker_args = []
-        for game_idx in range(num_games):
-            seed = game_idx + int(time.time())  # Unique seed
-            worker_args.append((
-                game_idx,
-                self.num_colors,
-                self.bottle_height,
-                self.num_bottles,
-                seed
-            ))
-        
-        # Statistics
         success_count = 0
         astar_count = 0
         greedy_count = 0
         total_moves = 0
         start_time = time.time()
         
-        print(f"🎯 Generating {num_games} expert games with A* Solver...")
-        print(f"⏱️  Start time: {datetime.now().strftime('%H:%M:%S')}\n")
+        pbar = tqdm(range(num_games), desc="Generating data")
         
-        # Multiprocessing pool
-        with Pool(num_workers) as pool:
-            # Use imap_unordered để get results ngay khi ready
-            results = pool.imap_unordered(solve_single_game, worker_args, chunksize=chunk_size)
+        for game_idx in pbar:
+            state = self.env.reset()
+            self.astar_solver.env = self.env
+            self.greedy_solver.env = self.env
             
-            # Progress bar
-            pbar = tqdm(total=num_games, desc="Generating data")
+            # Try A* first (with timeout)
+            solution = []
+            success = False
+            used_astar = False
             
-            for result in results:
-                # Update statistics
-                if result['success']:
+            # A* với giới hạn nodes
+            solution, success = self.astar_solver.solve(max_moves=1000, debug=False)
+            
+            if success:
+                success_count += 1
+                astar_count += 1
+                used_astar = True
+                total_moves += len(solution)
+            else:
+                # Fallback: dùng Greedy
+                self.greedy_solver.env = WaterSortEnv(self.env.num_colors, self.env.bottle_height, self.env.num_bottles)
+                self.greedy_solver.env.bottles = state.copy()
+                
+                solution, success = self.greedy_solver.solve(max_moves=200)
+                
+                if success:
                     success_count += 1
-                    total_moves += result['moves']
-                    self.dataset.extend(result['samples'])
-                    
-                    if result['used_astar']:
-                        astar_count += 1
-                    else:
-                        greedy_count += 1
+                    greedy_count += 1
+                    total_moves += len(solution)
                 else:
                     self.failed_games.append({
-                        'game_idx': result['game_idx'],
-                        'astar_nodes': result['astar_nodes']
+                        'game_idx': game_idx,
+                        'astar_nodes': self.astar_solver.debug_info['nodes_expanded']
                     })
-                
-                # Update progress bar
-                games_done = success_count + len(self.failed_games)
-                win_rate = success_count / games_done if games_done > 0 else 0
-                avg_moves = total_moves / success_count if success_count > 0 else 0
-                
-                pbar.set_description(
-                    f"Win: {win_rate:.1%}, Avg: {avg_moves:.1f}, "
-                    f"A*: {astar_count}, GD: {greedy_count}"
-                )
-                pbar.update(1)
             
-            pbar.close()
+            # Add samples
+            if success:
+                temp_env = WaterSortEnv(self.env.num_colors, self.env.bottle_height, self.env.num_bottles)
+                temp_env.bottles = state.copy()
+                
+                for move_idx, move in enumerate(solution):
+                    current_state = temp_env.get_state()
+                    
+                    policy_target = np.zeros(self.env.num_bottles * self.env.num_bottles)
+                    move_index = self._action_to_index(move)
+                    policy_target[move_index] = 1.0
+                    
+                    remaining_moves = len(solution) - move_idx
+                    value_target = 1.0 - (remaining_moves / len(solution)) * 0.5
+                    
+                    self.dataset.append((current_state, policy_target, value_target))
+                    
+                    temp_env.step(move)
+            
+            win_rate = success_count / (game_idx + 1)
+            avg_moves = total_moves / max(success_count, 1)
+            pbar.set_description(f"Win: {win_rate:.1%}, Avg: {avg_moves:.1f}, A*: {astar_count}, GD: {greedy_count}")
+            
+            # Debug output
+            if (game_idx + 1) % debug_interval == 0:
+                elapsed = time.time() - start_time
+                games_per_sec = (game_idx + 1) / elapsed
+                remaining_games = num_games - (game_idx + 1)
+                eta_seconds = remaining_games / games_per_sec if games_per_sec > 0 else 0
+                eta = str(timedelta(seconds=int(eta_seconds)))
+                
+                print(f"\n[DEBUG] Progress {game_idx+1}/{num_games}")
+                print(f"        Success rate: {success_count}/{game_idx+1} ({win_rate:.1%})")
+                print(f"        A* solver: {astar_count} games")
+                print(f"        Greedy fallback: {greedy_count} games")
+                print(f"        Avg moves: {avg_moves:.1f}")
+                print(f"        Samples: {len(self.dataset)}")
+                print(f"        Time: {str(timedelta(seconds=int(elapsed)))}")
+                print(f"        ETA: {eta}")
+                print(f"        Failed: {len(self.failed_games)}")
         
-        # Final statistics
-        elapsed = time.time() - start_time
-        
-        print(f"\n{'='*70}")
-        print(f"✅ DATA GENERATION COMPLETED!")
-        print(f"{'='*70}")
-        print(f"📊 RESULTS:")
-        print(f"   Generated samples: {len(self.dataset)}")
-        print(f"   Success rate: {success_count}/{num_games} ({success_count/num_games:.1%})")
-        print(f"   A* solutions: {astar_count}")
-        print(f"   Greedy fallback: {greedy_count}")
-        print(f"   Failed games: {len(self.failed_games)}")
-        print(f"   Avg moves (successful): {total_moves/success_count if success_count > 0 else 0:.1f}")
-        print(f"\n⏱️  PERFORMANCE:")
-        print(f"   Total time: {str(timedelta(seconds=int(elapsed)))}")
-        print(f"   Games/second: {num_games/elapsed:.2f}")
-        print(f"   Time/game: {elapsed/num_games:.2f}s")
-        print(f"{'='*70}\n")
+        print(f"\n✓ Generated {len(self.dataset)} training samples")
+        print(f"  Success rate: {success_count}/{num_games} ({success_count/num_games:.1%})")
+        print(f"  A* solutions: {astar_count}")
+        print(f"  Greedy fallback: {greedy_count}")
+        print(f"  Failed games: {len(self.failed_games)}")
         
         return success_count / num_games
     
-    def save_data(self, filename='heuristic_data_parallel.pkl'):
+    def save_data(self, filename='heuristic_data.pkl'):
         """Save generated data to file"""
         with open(filename, 'wb') as f:
             pickle.dump(self.dataset, f)
-        print(f"💾 Saved {len(self.dataset)} samples to {filename}")
+        print(f"✓ Saved {len(self.dataset)} samples to {filename}")
     
     def analyze_failed_games(self):
         """Analyze failed games"""
@@ -547,72 +472,28 @@ class ParallelHeuristicDataGenerator:
         print("📊 PHÂN TÍCH GAME THẤT BẠI")
         print("="*70)
         print(f"📈 Số game thất bại: {len(self.failed_games)}")
-        
-        if self.failed_games:
-            avg_nodes = np.mean([g['astar_nodes'] for g in self.failed_games])
-            print(f"📈 Avg A* nodes expanded: {avg_nodes:.0f}")
+    
+    def _action_to_index(self, action):
+        from_idx, to_idx = action
+        return from_idx * self.env.num_bottles + to_idx
 
 # =============================================================================
-# 6. TEST GAME (với multiprocessing)
+# 5. TEST GAME
 # =============================================================================
 
-def test_single_game(args):
-    """Test worker function"""
-    test_idx, num_colors, bottle_height, num_bottles, seed = args
-    
-    np.random.seed(seed)
-    random.seed(seed)
-    
-    env = WaterSortEnv(num_colors, bottle_height, num_bottles)
-    state = env.reset()
-    
-    astar_solver = AStarSolver(env)
-    solution, success = astar_solver.solve(max_moves=1000, debug=False)
-    
-    used_astar = success
-    
-    if not success:
-        greedy_env = WaterSortEnv(num_colors, bottle_height, num_bottles)
-        greedy_env.bottles = state.copy()
-        greedy_solver = GreedyFallback(greedy_env)
-        solution, success = greedy_solver.solve(max_moves=200)
-    
-    return {
-        'success': success,
-        'used_astar': used_astar,
-        'moves': len(solution) if success else 0
-    }
-
-class ParallelGameTester:
-    """Test solver on real games với multiprocessing"""
+class GameTester:
+    """Test solver on real games"""
     
     def __init__(self, num_colors=6, bottle_height=4, num_bottles=8):
-        self.num_colors = num_colors
-        self.bottle_height = bottle_height
-        self.num_bottles = num_bottles
+        self.env = WaterSortEnv(num_colors, bottle_height, num_bottles)
+        self.astar_solver = AStarSolver(self.env)
+        self.greedy_solver = GreedyFallback(self.env)
     
-    def test_solver_parallel(self, num_test_games=50, num_workers=None):
-        """Test solver với multiprocessing"""
-        if num_workers is None:
-            num_workers = max(1, cpu_count() - 1)
-        
+    def test_solver(self, num_test_games=50):
+        """Test solver on hard games"""
         print("\n" + "="*70)
-        print("🧪 TEST A* SOLVER - GAME ĐỘ KHÓ CAO (PARALLEL)")
+        print("🧪 TEST A* SOLVER - GAME ĐỘ KHÓ CAO")
         print("="*70)
-        print(f"   Workers: {num_workers}")
-        print(f"   Test games: {num_test_games}\n")
-        
-        # Prepare arguments
-        worker_args = []
-        for test_idx in range(num_test_games):
-            seed = test_idx + int(time.time()) + 999999
-            worker_args.append((
-                test_idx,
-                self.num_colors,
-                self.bottle_height,
-                self.num_bottles,
-                seed
-            ))
         
         results = {
             'wins': 0,
@@ -622,34 +503,36 @@ class ParallelGameTester:
             'greedy_count': 0
         }
         
-        # Multiprocessing
-        with Pool(num_workers) as pool:
-            test_results = list(tqdm(
-                pool.imap_unordered(test_single_game, worker_args),
-                total=num_test_games,
-                desc="Testing solver"
-            ))
+        pbar = tqdm(range(num_test_games), desc="Testing")
         
-        # Collect results
-        for result in test_results:
-            if result['success']:
-                results['wins'] += 1
-                results['moves_list'].append(result['moves'])
-                
-                if result['used_astar']:
-                    results['astar_count'] += 1
-                else:
+        for test_idx in pbar:
+            state = self.env.reset()
+            self.astar_solver.env = self.env
+            
+            solution, success = self.astar_solver.solve(max_moves=1000, debug=False)
+            
+            if not success:
+                self.greedy_solver.env = WaterSortEnv(self.env.num_colors, self.env.bottle_height, self.env.num_bottles)
+                self.greedy_solver.env.bottles = state.copy()
+                solution, success = self.greedy_solver.solve(max_moves=200)
+                if success:
                     results['greedy_count'] += 1
             else:
+                results['astar_count'] += 1
+            
+            if success:
+                results['wins'] += 1
+                results['moves_list'].append(len(solution))
+            else:
                 results['fails'] += 1
+            
+            pbar.set_description(f"Win: {results['wins']}/{test_idx+1} ({results['wins']/(test_idx+1):.1%})")
         
-        # Statistics
+        # Calculate statistics
         win_rate = results['wins'] / num_test_games
         avg_moves = np.mean(results['moves_list']) if results['moves_list'] else 0
         
-        print(f"\n{'='*70}")
-        print(f"📊 KẾT QUẢ TEST:")
-        print(f"{'='*70}")
+        print(f"\n📊 KẾT QUẢ TEST:")
         print(f"   ✅ Wins: {results['wins']}/{num_test_games} ({win_rate:.1%})")
         print(f"   ❌ Fails: {results['fails']}/{num_test_games} ({results['fails']/num_test_games:.1%})")
         print(f"   A* solutions: {results['astar_count']}")
@@ -660,41 +543,29 @@ class ParallelGameTester:
             print(f"   📊 Min moves: {min(results['moves_list'])}")
             print(f"   📊 Max moves: {max(results['moves_list'])}")
             print(f"   📊 Std dev: {np.std(results['moves_list']):.2f}")
-        print(f"{'='*70}\n")
         
         return results
 
 # =============================================================================
-# 7. MAIN TRAINING FUNCTION
+# 6. MAIN TRAINING FUNCTION
 # =============================================================================
 
 def train():
-    """Main training function với multiprocessing"""
+    """Main training function"""
     print("=" * 70)
-    print("🎯 PHASE 1: A* SOLVER DATA GENERATION (PARALLEL)")
+    print("🎯 PHASE 1: A* SOLVER DATA GENERATION")
     print("=" * 70)
-    print(f"⏱️  Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"💻 CPU cores: {cpu_count()}")
-    print()
+    print(f"⏱️  Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     total_start_time = time.time()
     
-    # === STEP 1: Generate data (PARALLEL) ===
-    print("\n📝 STEP 1: Generating Training Data (PARALLEL)")
+    # === STEP 1: Generate data ===
+    print("\n📝 STEP 1: Generating Training Data")
     print("-" * 70)
     gen_start_time = time.time()
     
-    generator = ParallelHeuristicDataGenerator(
-        num_colors=6,
-        bottle_height=4,
-        num_bottles=8
-    )
-    
-    win_rate = generator.generate_data_parallel(
-        num_games=5000,
-        num_workers=None,  # Auto-detect
-        chunk_size=50
-    )
+    generator = HeuristicDataGenerator(num_colors=6, bottle_height=4, num_bottles=8)
+    win_rate = generator.generate_data(num_games=5000, debug_interval=500)
     
     gen_elapsed = time.time() - gen_start_time
     print(f"⏱️  Generation time: {str(timedelta(seconds=int(gen_elapsed)))}")
@@ -707,20 +578,13 @@ def train():
     # === STEP 3: Save data ===
     print("\n💾 STEP 3: Saving Data")
     print("-" * 70)
-    generator.save_data('heuristic_data_parallel.pkl')
+    generator.save_data('heuristic_data.pkl')
     
-    # === STEP 4: Test solver (PARALLEL) ===
-    print("\n🧪 STEP 4: Testing on Real Games (PARALLEL)")
+    # === STEP 4: Test solver ===
+    print("\n🧪 STEP 4: Testing on Real Games")
     print("-" * 70)
-    tester = ParallelGameTester(
-        num_colors=6,
-        bottle_height=4,
-        num_bottles=8
-    )
-    test_results = tester.test_solver_parallel(
-        num_test_games=50,
-        num_workers=None  # Auto-detect
-    )
+    tester = GameTester(num_colors=6, bottle_height=4, num_bottles=8)
+    test_results = tester.test_solver(num_test_games=50)
     
     # === FINAL SUMMARY ===
     total_elapsed = time.time() - total_start_time
@@ -738,17 +602,8 @@ def train():
     print(f"\n⏱️  TIMING:")
     print(f"   Generation time: {str(timedelta(seconds=int(gen_elapsed)))}")
     print(f"   Total time: {str(timedelta(seconds=int(total_elapsed)))}")
-    print(f"   Speedup vs single-core: ~{cpu_count()-1}x")
-    print(f"\n💾 OUTPUT:")
-    print(f"   Saved to: heuristic_data_parallel.pkl")
+    print(f"   Saved to: heuristic_data.pkl")
     print(f"{'='*70}\n")
 
 if __name__ == "__main__":
-    # Set multiprocessing start method (important cho Colab)
-    import multiprocessing
-    try:
-        multiprocessing.set_start_method('spawn')
-    except RuntimeError:
-        pass  # Already set
-    
     train()
