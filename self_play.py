@@ -314,6 +314,9 @@ class OptimizedMCTS:
         
         self.env = WaterSortEnv()
         self.nodes_cache = {}
+        self.nn_cache = {}  # Cache neural network outputs
+        self.cache_hits = 0
+        self.cache_misses = 0
     
     def _hash_state(self, state):
         """Hash state"""
@@ -341,8 +344,9 @@ class OptimizedMCTS:
         """Select và expand node"""
         current_state = root_state.copy()
         path = [node]
+        max_depth = 200  # Giới hạn độ sâu để tránh vòng lặp vô tận
         
-        while True:
+        for depth in range(max_depth):
             self.env.bottles = current_state.copy()
             
             # Terminal check
@@ -354,6 +358,8 @@ class OptimizedMCTS:
                 self._expand_node(node, current_state)
                 if len(node.children) == 0:
                     return node, current_state
+                # Sau khi expand thành công, return ngay để evaluate
+                return node, current_state
             
             # Select best child
             best_score = -float('inf')
@@ -376,6 +382,7 @@ class OptimizedMCTS:
             current_state = next_state
             path.append(node)
         
+        # Đã đạt max_depth
         return node, current_state
     
     def _expand_node(self, node, state):
@@ -410,11 +417,21 @@ class OptimizedMCTS:
     
     def _evaluate(self, state):
         """Evaluate state bằng neural network"""
+        state_hash = self._hash_state(state)
+        
+        # Check cache
+        if state_hash in self.nn_cache:
+            self.cache_hits += 1
+            return self.nn_cache[state_hash]
+        
+        self.cache_misses += 1
         state_tensor = self.processor.state_to_tensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             _, value = self.model(state_tensor)
         
-        return value.item()
+        result = value.item()
+        self.nn_cache[state_hash] = result
+        return result
     
     def _backpropagate(self, node, value):
         """Backpropagation"""
@@ -502,14 +519,18 @@ class SelfPlayAgent:
         self.replay_buffer = deque(maxlen=20000)
         self.win_buffer = deque(maxlen=5000)
         
-    def play_game(self, temperature=1.0, max_moves=200):
+    def play_game(self, temperature=1.0, max_moves=200, verbose=False):
         """Play một game"""
         state = self.env.reset()
+        if verbose:
+            print(f"  🎮 Starting new game...")
         game_history = []
         
         for move_idx in range(max_moves):
             # Get MCTS policy
             policy_probs, action = self.mcts.search(state, temperature)
+            if verbose and move_idx % 5 == 0:
+                print(f"    Move {move_idx}: {len(self.env.get_valid_moves())} valid moves")
             
             if action is None:
                 break
@@ -589,6 +610,8 @@ class SelfPlayDataGenerator:
         
         pbar = tqdm(range(num_games), desc="Self-play generation")
         
+        print(f"💡 Tip: Giảm MCTS simulations xuống 25-50 để chạy nhanh hơn\n")
+        
         for game_idx in pbar:
             game_start = time.time()
             
@@ -626,6 +649,12 @@ class SelfPlayDataGenerator:
         print(f"   Avg moves (when won): {avg_moves:.1f}")
         print(f"   Total time: {total_time:.1f}s")
         print(f"   Avg time/game: {avg_time:.2f}s")
+        
+        # Cache statistics
+        total_evals = self.agent.mcts.cache_hits + self.agent.mcts.cache_misses
+        if total_evals > 0:
+            cache_rate = self.agent.mcts.cache_hits / total_evals
+            print(f"   Cache hit rate: {cache_rate:.1%} ({self.agent.mcts.cache_hits}/{total_evals})")
         
         return self.agent.get_training_data()
     
@@ -670,7 +699,7 @@ def run_self_play():
     # Số simulations
     while True:
         try:
-            num_simulations = int(input("Nhập số MCTS simulations (mặc định: 100): ") or "100")
+            num_simulations = int(input("Nhập số MCTS simulations (mặc định: 50): ") or "50")
             if num_simulations > 0:
                 break
             else:
@@ -728,3 +757,43 @@ def run_self_play():
 
 if __name__ == "__main__":
     run_self_play()
+    
+
+# ======================================================================
+# 🎯 PHASE 3: SELF-PLAY DATA GENERATION (STANDALONE)
+# ======================================================================
+
+# 📁 CÁC FILE PTH CÓ SẴN:
+# ----------------------------------------------------------------------
+#   1. watersort_imitation_v1.pth               (32.8 MB)
+# ----------------------------------------------------------------------
+# Nhập số thứ tự file (ví dụ: 1): 
+# ❌ Vui lòng nhập số nguyên hợp lệ
+# Nhập số thứ tự file (ví dụ: 1): 1
+# ✅ Đã chọn: watersort_imitation_v1.pth
+
+# ⚙️  CẤU HÌNH SELF-PLAY:
+# ----------------------------------------------------------------------
+# Nhập số game muốn generate (mặc định: 100): 100
+# Nhập số MCTS simulations (mặc định: 50): 
+# Nhập temperature (mặc định: 1.0): 
+# Sử dụng adaptive temperature? (y/n, mặc định: n): 
+# ----------------------------------------------------------------------
+# ✅ Configuration:
+#    Model: watersort_imitation_v1.pth
+#    Số games: 100
+#    MCTS simulations: 50
+#    Temperature: 1.0
+#    Adaptive temp: False
+# ======================================================================
+
+# 🚀 Device: cpu
+# 📁 Loading model từ watersort_imitation_v1.pth
+# ✅ Model loaded successfully
+
+# 🎯 Generating 100 self-play games...
+#    Temperature: 1.0 | Adaptive: False
+# ----------------------------------------------------------------------
+# Self-play generation:   0%|          | 0/100 [00:00<?, ?it/s]💡 Tip: Giảm MCTS simulations xuống 25-50 để chạy nhanh hơn
+
+# Win: 55.6% | Moves: 18.2 | Time: 59.4s:   9%|▉         | 9/100 [08:54<1:19:48, 52.62s/it]
